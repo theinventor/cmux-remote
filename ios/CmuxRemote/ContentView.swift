@@ -24,6 +24,7 @@ struct ContentView: View {
                 WorkspaceView(
                     workspaceStore: workspaceStore,
                     surfaceStore: surfaceStore,
+                    notifStore: notifStore,
                     preferredSurfaceId: $requestedSurfaceId,
                     onBack: { selectedTab = .workspaces }
                 )

@@ -5,6 +5,7 @@ import SharedKit
 struct WorkspaceView: View {
     @Bindable var workspaceStore: WorkspaceStore
     @Bindable var surfaceStore: SurfaceStore
+    @Bindable var notifStore: NotificationStore
     @Binding var preferredSurfaceId: String?
     let onBack: () -> Void
     @State private var showDrawer = false
@@ -66,6 +67,7 @@ struct WorkspaceView: View {
         .sheet(isPresented: $showDrawer) {
             WorkspaceDrawer(store: workspaceStore) { workspaceId, surfaceId in
                 workspaceStore.selectedId = workspaceId
+                notifStore.markWorkspaceSeen(workspaceId)
                 activeWorkspaceId = workspaceId
                 activeSurfaceId = surfaceId
                 surfaceActionError = nil
