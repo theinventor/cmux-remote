@@ -80,6 +80,9 @@ public actor Routes {
             try? deviceStore.revoke(deviceId: did)
             return .init(.noContent)
 
+        case (.POST, "/v1/realtime/token"):
+            return await realtimeToken(remoteAddr: remoteAddr, body: body)
+
         default:
             return .init(.notFound)
         }
@@ -121,6 +124,55 @@ public actor Routes {
         try? deviceStore.setAPNsToken(deviceId: deviceId,
                                       token: p.apnsToken, env: p.env)
         return .init(.noContent)
+    }
+
+    // MARK: - POST /v1/realtime/token
+
+    private func realtimeToken(remoteAddr: String, body: Data?) async -> HTTPResponseLite {
+        guard let apiKey = DotEnv.get("OPENAI_API_KEY"), !apiKey.isEmpty else {
+            return .init(.internalServerError, body: Data(#"{"error":"OPENAI_API_KEY not configured"}"#.utf8))
+        }
+
+        if !allowLocalhost || !Self.isLoopback(remoteAddr) {
+            do {
+                let peer = try await auth.whois(remoteAddr: remoteAddr)
+                guard config.allowLogin.contains(peer.loginName) else {
+                    return .init(.forbidden)
+                }
+            } catch {
+                return .init(.forbidden)
+            }
+        }
+
+        let parsed = body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let model = parsed?["model"] as? String ?? "gpt-realtime-2"
+        let voice = parsed?["voice"] as? String ?? "verse"
+
+        let payload: [String: Any] = [
+            "session": [
+                "type": "realtime",
+                "model": model,
+                "audio": [
+                    "output": ["voice": voice],
+                ],
+            ],
+        ]
+
+        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/realtime/client_secrets")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .init(.internalServerError)
+            }
+            return .init(HTTPResponseStatus(statusCode: http.statusCode), body: data)
+        } catch {
+            return .init(.badGateway, body: Data(#"{"error":"failed to reach OpenAI"}"#.utf8))
+        }
     }
 
     // MARK: - POST /v1/devices/me/register
