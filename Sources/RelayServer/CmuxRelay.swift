@@ -37,6 +37,7 @@ struct Serve: AsyncParsableCommand {
 
     func run() async throws {
         let logger = Logger(label: "cmux-relay")
+        let audit = RelayAuditLog.shared
         let store = ConfigStore(url: URL(fileURLWithPath: config))
         try store.reload()
 
@@ -86,11 +87,13 @@ struct Serve: AsyncParsableCommand {
         let auth = TailscaledLocalAuth()
         let routes = Routes(deviceStore: deviceStore,
                             config: store.current,
-                            auth: auth)
+                            auth: auth,
+                            audit: audit)
         let server = HTTPServer(group: group, routes: routes, auth: auth,
                                 deviceStore: deviceStore,
                                 sessionManager: manager,
-                                cmux: facade)
+                                cmux: facade,
+                                audit: audit)
 
         let (host, port) = parseListen(store.current.listen)
 
@@ -107,6 +110,12 @@ struct Serve: AsyncParsableCommand {
         signal(SIGHUP, SIG_IGN)
 
         logger.info("starting cmux-relay on \(host):\(port)")
+        audit.event("relay.start", fields: [
+            "host": .string(host),
+            "port": .int(Int64(port)),
+            "config": .string(config),
+            "log_path": .string(audit.fileURL.path),
+        ])
         try await server.run(host: host, port: port)
     }
 }

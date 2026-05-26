@@ -27,16 +27,19 @@ public actor Routes {
     private let config: RelayConfig
     private let auth: AuthService
     private let allowLocalhost: Bool
+    private let audit: RelayAuditLog
 
     public init(deviceStore: DeviceStore,
                 config: RelayConfig,
                 auth: AuthService,
-                allowLocalhost: Bool = Routes.defaultAllowLocalhost())
+                allowLocalhost: Bool = Routes.defaultAllowLocalhost(),
+                audit: RelayAuditLog = .shared)
     {
         self.deviceStore = deviceStore
         self.config = config
         self.auth = auth
         self.allowLocalhost = allowLocalhost
+        self.audit = audit
     }
 
     /// Reads `CMUX_DEV_ALLOW_LOCALHOST=1` from the environment. When true,
@@ -82,6 +85,9 @@ public actor Routes {
 
         case (.POST, "/v1/realtime/token"):
             return await realtimeToken(remoteAddr: remoteAddr, body: body)
+
+        case (.POST, "/v1/voice/log"):
+            return await voiceLog(remoteAddr: remoteAddr, deviceId: deviceId, body: body)
 
         default:
             return .init(.notFound)
@@ -130,23 +136,25 @@ public actor Routes {
 
     private func realtimeToken(remoteAddr: String, body: Data?) async -> HTTPResponseLite {
         guard let apiKey = DotEnv.get("OPENAI_API_KEY"), !apiKey.isEmpty else {
+            audit.event("realtime.token.error", fields: [
+                "remote_addr": .string(remoteAddr),
+                "reason": .string("missing_openai_api_key"),
+            ])
             return .init(.internalServerError, body: Data(#"{"error":"OPENAI_API_KEY not configured"}"#.utf8))
         }
 
-        if !allowLocalhost || !Self.isLoopback(remoteAddr) {
-            do {
-                let peer = try await auth.whois(remoteAddr: remoteAddr)
-                guard config.allowLogin.contains(peer.loginName) else {
-                    return .init(.forbidden)
-                }
-            } catch {
-                return .init(.forbidden)
-            }
+        guard await authorizeRemote(remoteAddr: remoteAddr, event: "realtime.token") else {
+            return .init(.forbidden)
         }
 
         let parsed = body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let model = parsed?["model"] as? String ?? "gpt-realtime-2"
         let voice = parsed?["voice"] as? String ?? "verse"
+        audit.event("realtime.token.request", fields: [
+            "remote_addr": .string(remoteAddr),
+            "model": .string(model),
+            "voice": .string(voice),
+        ])
 
         let payload: [String: Any] = [
             "session": [
@@ -167,12 +175,45 @@ public actor Routes {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else {
+                audit.event("realtime.token.error", fields: [
+                    "remote_addr": .string(remoteAddr),
+                    "model": .string(model),
+                    "voice": .string(voice),
+                    "reason": .string("non_http_openai_response"),
+                ])
                 return .init(.internalServerError)
             }
+            audit.event("realtime.token.response", fields: [
+                "remote_addr": .string(remoteAddr),
+                "model": .string(model),
+                "voice": .string(voice),
+                "status": .int(Int64(http.statusCode)),
+                "response_bytes": .int(Int64(data.count)),
+            ])
             return .init(HTTPResponseStatus(statusCode: http.statusCode), body: data)
         } catch {
+            audit.event("realtime.token.error", fields: [
+                "remote_addr": .string(remoteAddr),
+                "model": .string(model),
+                "voice": .string(voice),
+                "reason": RelayAuditLog.string(String(describing: error)),
+            ])
             return .init(.badGateway, body: Data(#"{"error":"failed to reach OpenAI"}"#.utf8))
         }
+    }
+
+    // MARK: - POST /v1/voice/log
+
+    private func voiceLog(remoteAddr: String, deviceId: String?, body: Data?) async -> HTTPResponseLite {
+        guard await authorizeRemote(remoteAddr: remoteAddr, event: "voice.log") else {
+            return .init(.forbidden)
+        }
+        audit.event("voice.log", fields: [
+            "remote_addr": .string(remoteAddr),
+            "device_id": RelayAuditLog.optionalString(deviceId),
+            "body": RelayAuditLog.bodyPreview(body),
+        ])
+        return .init(.accepted, body: Data(#"{"ok":true}"#.utf8))
     }
 
     // MARK: - POST /v1/devices/me/register
@@ -197,12 +238,26 @@ public actor Routes {
                 // tailscaled didn't recognize the peer at all — treat as
                 // forbidden so the phone shows a clear "not on tailnet" UI
                 // rather than a 5xx that suggests a relay bug.
+                audit.event("device.register.reject", fields: [
+                    "remote_addr": .string(remoteAddr),
+                    "reason": .string("unauthorized_peer"),
+                ])
                 return .init(.forbidden)
             } catch {
+                audit.event("device.register.error", fields: [
+                    "remote_addr": .string(remoteAddr),
+                    "reason": RelayAuditLog.string(String(describing: error)),
+                ])
                 return .init(.internalServerError)
             }
 
             guard config.allowLogin.contains(peer.loginName) else {
+                audit.event("device.register.reject", fields: [
+                    "remote_addr": .string(remoteAddr),
+                    "login_name": .string(peer.loginName),
+                    "hostname": .string(peer.hostname),
+                    "reason": .string("login_not_allowed"),
+                ])
                 return .init(.forbidden)
             }
         }
@@ -221,9 +276,57 @@ public actor Routes {
                 let token: String
             }
             let body = try JSONEncoder().encode(R(device_id: deviceId, token: token))
+            audit.event("device.register", fields: [
+                "remote_addr": .string(remoteAddr),
+                "device_id": .string(deviceId),
+                "login_name": .string(peer.loginName),
+                "hostname": .string(peer.hostname),
+                "os": .string(peer.os),
+            ])
             return .init(.ok, body: body)
         } catch {
+            audit.event("device.register.error", fields: [
+                "remote_addr": .string(remoteAddr),
+                "device_id": .string(deviceId),
+                "reason": RelayAuditLog.string(String(describing: error)),
+            ])
             return .init(.internalServerError)
+        }
+    }
+
+    private func authorizeRemote(remoteAddr: String, event: String) async -> Bool {
+        if allowLocalhost, Self.isLoopback(remoteAddr) {
+            audit.event("\(event).auth", fields: [
+                "remote_addr": .string(remoteAddr),
+                "mode": .string("localhost_bypass"),
+            ])
+            return true
+        }
+
+        do {
+            let peer = try await auth.whois(remoteAddr: remoteAddr)
+            guard config.allowLogin.contains(peer.loginName) else {
+                audit.event("\(event).auth_reject", fields: [
+                    "remote_addr": .string(remoteAddr),
+                    "login_name": .string(peer.loginName),
+                    "hostname": .string(peer.hostname),
+                    "reason": .string("login_not_allowed"),
+                ])
+                return false
+            }
+            audit.event("\(event).auth", fields: [
+                "remote_addr": .string(remoteAddr),
+                "login_name": .string(peer.loginName),
+                "hostname": .string(peer.hostname),
+                "os": .string(peer.os),
+            ])
+            return true
+        } catch {
+            audit.event("\(event).auth_reject", fields: [
+                "remote_addr": .string(remoteAddr),
+                "reason": RelayAuditLog.string(String(describing: error)),
+            ])
+            return false
         }
     }
 }

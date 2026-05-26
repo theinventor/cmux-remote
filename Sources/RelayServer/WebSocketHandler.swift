@@ -36,9 +36,18 @@ public actor WSProtocolMachine {
     }
 
     private let cmux: CMUXFacade
+    private let audit: RelayAuditLog?
+    private let connectionDeviceId: String?
     private var helloed = false
 
-    public init(cmux: CMUXFacade) { self.cmux = cmux }
+    public init(cmux: CMUXFacade,
+                audit: RelayAuditLog? = nil,
+                deviceId: String? = nil)
+    {
+        self.cmux = cmux
+        self.audit = audit
+        self.connectionDeviceId = deviceId
+    }
 
     public var hasHelloed: Bool { helloed }
 
@@ -48,24 +57,64 @@ public actor WSProtocolMachine {
         let data = Data(text.utf8)
         if !helloed {
             guard let hello = try? JSONDecoder().decode(HelloFrame.self, from: data) else {
+                audit?.event("ws.hello.invalid", fields: [
+                    "device_id": RelayAuditLog.optionalString(connectionDeviceId),
+                    "body": RelayAuditLog.string(text, maxLength: 1_000),
+                ])
                 return [.close]
             }
             helloed = true
+            audit?.event("ws.hello", fields: [
+                "device_id": .string(hello.deviceId),
+                "connection_device_id": RelayAuditLog.optionalString(connectionDeviceId),
+                "app_version": .string(hello.appVersion),
+                "protocol_version": .int(Int64(hello.protocolVersion)),
+            ])
             return [.attachSession(deviceId: hello.deviceId)]
         }
 
         guard let req = try? JSONDecoder().decode(RPCRequest.self, from: data) else {
+            audit?.event("rpc.invalid_json", fields: [
+                "device_id": RelayAuditLog.optionalString(connectionDeviceId),
+                "body": RelayAuditLog.string(text, maxLength: 1_000),
+            ])
             return []
         }
+        audit?.event("rpc.request", fields: [
+            "device_id": RelayAuditLog.optionalString(connectionDeviceId),
+            "rpc_id": .string(req.id),
+            "method": .string(req.method),
+            "params": RelayAuditLog.fromJSON(req.params),
+        ])
         if let relayAction = Self.relayOwnedAction(for: req) {
+            audit?.event("rpc.relay_action", fields: [
+                "device_id": RelayAuditLog.optionalString(connectionDeviceId),
+                "rpc_id": .string(req.id),
+                "method": .string(req.method),
+                "action": Self.auditValue(for: relayAction),
+            ])
             return [relayAction]
         }
 
         do {
             let result = try await cmux.dispatch(method: req.method, params: req.params)
+            audit?.event("rpc.response", fields: [
+                "device_id": RelayAuditLog.optionalString(connectionDeviceId),
+                "rpc_id": .string(req.id),
+                "method": .string(req.method),
+                "ok": .bool(true),
+                "result": RelayAuditLog.fromJSON(result),
+            ])
             let resp = RPCResponse(id: req.id, ok: true, result: result, error: nil)
             return [.sendText(Self.encode(resp))]
         } catch {
+            audit?.event("rpc.response", fields: [
+                "device_id": RelayAuditLog.optionalString(connectionDeviceId),
+                "rpc_id": .string(req.id),
+                "method": .string(req.method),
+                "ok": .bool(false),
+                "error": RelayAuditLog.string(String(describing: error)),
+            ])
             let err = RPCError(code: "internal_error",
                                message: String(describing: error))
             let resp = RPCResponse(id: req.id, ok: false, result: nil, error: err)
@@ -76,7 +125,11 @@ public actor WSProtocolMachine {
     /// The 100ms hello timer fired. Returns `[.close]` if the peer never
     /// sent a hello, `[]` otherwise (handler will see nil and no-op).
     public func helloMissed() -> [Action] {
-        helloed ? [] : [.close]
+        if helloed { return [] }
+        audit?.event("ws.hello.timeout", fields: [
+            "device_id": RelayAuditLog.optionalString(connectionDeviceId),
+        ])
+        return [.close]
     }
 
 
@@ -102,6 +155,34 @@ public actor WSProtocolMachine {
             return .unsubscribe(responseId: req.id, surfaceId: surfaceId)
         default:
             return nil
+        }
+    }
+
+    private static func auditValue(for action: Action) -> AuditValue {
+        switch action {
+        case .sendText:
+            return .object(["kind": .string("send_text")])
+        case .close:
+            return .object(["kind": .string("close")])
+        case .attachSession(let deviceId):
+            return .object([
+                "kind": .string("attach_session"),
+                "device_id": .string(deviceId),
+            ])
+        case .subscribe(let responseId, let workspaceId, let surfaceId, let lines):
+            return .object([
+                "kind": .string("subscribe"),
+                "response_id": .string(responseId),
+                "workspace_id": .string(workspaceId),
+                "surface_id": .string(surfaceId),
+                "lines": .int(Int64(lines)),
+            ])
+        case .unsubscribe(let responseId, let surfaceId):
+            return .object([
+                "kind": .string("unsubscribe"),
+                "response_id": .string(responseId),
+                "surface_id": .string(surfaceId),
+            ])
         }
     }
 
@@ -172,6 +253,7 @@ public final class WebSocketHandler: ChannelInboundHandler, @unchecked Sendable 
     private let machine: WSProtocolMachine
     private let actionQueue = WSActionQueue()
     private let logger = Logger(label: "cmux-relay.ws")
+    private let audit: RelayAuditLog
 
     private var helloTimer: Scheduled<Void>?
     private var session: Session?
@@ -179,15 +261,23 @@ public final class WebSocketHandler: ChannelInboundHandler, @unchecked Sendable 
     public init(deviceId: String,
                 deviceStore: DeviceStore,
                 sessionManager: SessionManager,
-                cmuxClient: CMUXFacade)
+                cmuxClient: CMUXFacade,
+                audit: RelayAuditLog = .shared)
     {
         self.deviceId = deviceId
         self.deviceStore = deviceStore
         self.sessionManager = sessionManager
-        self.machine = WSProtocolMachine(cmux: cmuxClient)
+        self.audit = audit
+        self.machine = WSProtocolMachine(cmux: cmuxClient,
+                                         audit: audit,
+                                         deviceId: deviceId)
     }
 
     public func channelActive(context: ChannelHandlerContext) {
+        audit.event("ws.channel_active", fields: [
+            "device_id": .string(deviceId),
+            "remote_addr": RelayAuditLog.optionalString(context.remoteAddress?.ipAddress),
+        ])
         let machine = self.machine
         let channel = WSChannelContext(context)
         helloTimer = context.eventLoop.scheduleTask(in: .milliseconds(100)) { [weak self] in
@@ -219,6 +309,11 @@ public final class WebSocketHandler: ChannelInboundHandler, @unchecked Sendable 
     public func channelInactive(context: ChannelHandlerContext) {
         helloTimer?.cancel()
         helloTimer = nil
+        audit.event("ws.channel_inactive", fields: [
+            "device_id": .string(deviceId),
+            "remote_addr": RelayAuditLog.optionalString(context.remoteAddress?.ipAddress),
+            "had_session": .bool(session != nil),
+        ])
         if let s = session {
             session = nil
             let mgr = sessionManager

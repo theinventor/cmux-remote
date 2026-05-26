@@ -28,6 +28,7 @@ public final class HTTPServer: @unchecked Sendable {
     public let deviceStore: DeviceStore
     public let sessionManager: SessionManager
     public let cmux: CMUXFacade
+    public let audit: RelayAuditLog
     public let logger = Logger(label: "HTTPServer")
 
     public init(group: MultiThreadedEventLoopGroup,
@@ -35,7 +36,8 @@ public final class HTTPServer: @unchecked Sendable {
                 auth: AuthService,
                 deviceStore: DeviceStore,
                 sessionManager: SessionManager,
-                cmux: CMUXFacade)
+                cmux: CMUXFacade,
+                audit: RelayAuditLog = .shared)
     {
         self.group = group
         self.routes = routes
@@ -43,6 +45,7 @@ public final class HTTPServer: @unchecked Sendable {
         self.deviceStore = deviceStore
         self.sessionManager = sessionManager
         self.cmux = cmux
+        self.audit = audit
     }
 
     /// Bind the server and return the listening channel. The caller is
@@ -54,6 +57,7 @@ public final class HTTPServer: @unchecked Sendable {
         let store = self.deviceStore
         let manager = self.sessionManager
         let cmux = self.cmux
+        let audit = self.audit
 
         let bs = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 64)
@@ -63,11 +67,20 @@ public final class HTTPServer: @unchecked Sendable {
                 let upgrader = NIOWebSocketServerUpgrader(
                     shouldUpgrade: { @Sendable ch, head in
                         let path = head.uri.split(separator: "?").first.map(String.init) ?? head.uri
-                        guard path == "/v1/ws",
-                              HTTPServer.deviceIdFromWSHeaders(head.headers, store: store) != nil
-                        else {
+                        let did = HTTPServer.deviceIdFromWSHeaders(head.headers, store: store)
+                        guard path == "/v1/ws", did != nil else {
+                            audit.event("ws.upgrade.reject", fields: [
+                                "remote_addr": RelayAuditLog.optionalString(ch.remoteAddress?.ipAddress),
+                                "path": .string(path),
+                                "reason": .string(path == "/v1/ws" ? "missing_or_invalid_bearer" : "wrong_path"),
+                            ])
                             return ch.eventLoop.makeSucceededFuture(nil)
                         }
+                        audit.event("ws.upgrade.accept", fields: [
+                            "remote_addr": RelayAuditLog.optionalString(ch.remoteAddress?.ipAddress),
+                            "path": .string(path),
+                            "device_id": RelayAuditLog.optionalString(did),
+                        ])
                         // URLSessionWebSocketTask validates the negotiated
                         // `Sec-WebSocket-Protocol` against the *first*
                         // entry it offered (Apple's implementation is
@@ -89,11 +102,14 @@ public final class HTTPServer: @unchecked Sendable {
                         let handler = WebSocketHandler(deviceId: did,
                                                        deviceStore: store,
                                                        sessionManager: manager,
-                                                       cmuxClient: cmux)
+                                                       cmuxClient: cmux,
+                                                       audit: audit)
                         return ch.pipeline.addHandler(handler)
                     }
                 )
-                let httpHandler = HTTPHandler(routes: routes, deviceStore: store)
+                let httpHandler = HTTPHandler(routes: routes,
+                                              deviceStore: store,
+                                              audit: audit)
                 let upgradeConfig: NIOHTTPServerUpgradeConfiguration = (
                     upgraders: [upgrader],
                     completionHandler: { _ in
@@ -112,6 +128,9 @@ public final class HTTPServer: @unchecked Sendable {
     public func run(host: String, port: Int) async throws {
         let chan = try await bind(host: host, port: port)
         logger.info("listening on \(chan.localAddress?.description ?? "?")")
+        audit.event("relay.listening", fields: [
+            "address": .string(chan.localAddress?.description ?? "?"),
+        ])
         try await chan.closeFuture.get()
     }
 
@@ -197,13 +216,17 @@ private final class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler,
 
     private let routes: Routes
     private let deviceStore: DeviceStore
+    private let audit: RelayAuditLog
     private var pendingHead: HTTPRequestHead?
     private var bodyBuffer = ByteBuffer()
     private var deviceId: String?
+    private var requestId: String?
+    private var startedAt: DispatchTime?
 
-    init(routes: Routes, deviceStore: DeviceStore) {
+    init(routes: Routes, deviceStore: DeviceStore, audit: RelayAuditLog = .shared) {
         self.routes = routes
         self.deviceStore = deviceStore
+        self.audit = audit
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -212,6 +235,16 @@ private final class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler,
             pendingHead = head
             bodyBuffer.clear()
             deviceId = HTTPServer.deviceIdFromAuthHeader(head.headers, store: deviceStore)
+            requestId = UUID().uuidString
+            startedAt = DispatchTime.now()
+            audit.event("http.request", fields: [
+                "request_id": RelayAuditLog.optionalString(requestId),
+                "method": .string(head.method.rawValue),
+                "path": .string(head.uri),
+                "remote_addr": RelayAuditLog.optionalString(context.remoteAddress?.ipAddress),
+                "device_id": RelayAuditLog.optionalString(deviceId),
+                "content_length": .int(Int64(head.headers.first(name: "Content-Length") ?? "0") ?? 0),
+            ])
 
         case .body(var buf):
             bodyBuffer.writeBuffer(&buf)
@@ -229,18 +262,39 @@ private final class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler,
             let remote = context.remoteAddress?.ipAddress ?? ""
             let routes = self.routes
             let loop = context.eventLoop
+            let audit = self.audit
+            let requestId = self.requestId
+            let startedAt = self.startedAt
             Task { [weak self] in
                 let resp = await routes.handle(method: head.method,
                                                path: head.uri,
                                                body: body,
                                                deviceId: did,
                                                remoteAddr: remote)
+                let durationMs: Int64
+                if let startedAt {
+                    durationMs = Int64(Double(DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds) / 1_000_000.0)
+                } else {
+                    durationMs = 0
+                }
+                audit.event("http.response", fields: [
+                    "request_id": RelayAuditLog.optionalString(requestId),
+                    "method": .string(head.method.rawValue),
+                    "path": .string(head.uri),
+                    "remote_addr": .string(remote),
+                    "device_id": RelayAuditLog.optionalString(did),
+                    "status": .int(Int64(resp.status.code)),
+                    "response_bytes": .int(Int64(resp.body?.count ?? 0)),
+                    "duration_ms": .int(durationMs),
+                ])
                 loop.execute {
                     self?.respond(context: context, resp: resp)
                 }
             }
             pendingHead = nil
             deviceId = nil
+            self.requestId = nil
+            self.startedAt = nil
         }
     }
 
