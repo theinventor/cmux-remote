@@ -190,8 +190,32 @@ cmux 소스 코드는 이 저장소에 포함되지 않습니다. 문서화된 J
 ### 1. Mac에 relay 빌드 + 설치
 
 ```bash
-git clone https://github.com/NewTurn2017/cmux-remote.git
+git clone https://github.com/theinventor/cmux-remote.git
 cd cmux-remote
+
+mkdir -p ~/.cmuxremote
+cat > ~/.cmuxremote/relay.json <<'EOF'
+{
+  "listen": "0.0.0.0:4399",
+  "allow_login": ["you@example.com"],
+  "apns": {
+    "key_path": "",
+    "key_id": "",
+    "team_id": "",
+    "topic": "",
+    "env": "sandbox"
+  },
+  "snippets": [],
+  "default_fps": 15,
+  "idle_fps": 5
+}
+EOF
+
+cat > ~/.cmuxremote/.env <<'EOF'
+OPENAI_API_KEY=sk-your-openai-api-key
+EOF
+chmod 600 ~/.cmuxremote/.env
+
 swift build -c release --product cmux-relay
 
 # launchd 유저 에이전트로 설치 (로그인 시 자동 시작)
@@ -206,7 +230,7 @@ swift build -c release --product cmux-relay
 
 ```bash
 curl -s http://$(tailscale ip -4):4399/v1/health
-# {"ok":true,"version":"0.1.0"}
+# {"ok":true}
 ```
 
 소켓 점검:
@@ -240,20 +264,49 @@ iPhone에서 cmux Remote 열기:
 
 ## 설정
 
-Relay는 `~/.cmuxremote/relay.json`을 읽습니다 (`install-launchd.sh`가
-없으면 생성):
+Relay는 `~/.cmuxremote/relay.json`을 읽습니다:
 
 ```json
 {
-  "listen":      "0.0.0.0:4399",
-  "cmux_socket": "/Users/<you>/Library/Application Support/cmux/cmux.sock",
-  "diff_hz":     15
+  "listen": "0.0.0.0:4399",
+  "allow_login": ["you@example.com"],
+  "apns": {
+    "key_path": "",
+    "key_id": "",
+    "team_id": "",
+    "topic": "",
+    "env": "sandbox"
+  },
+  "snippets": [],
+  "default_fps": 15,
+  "idle_fps": 5
 }
 ```
 
 `listen`은 0.0.0.0이지만 비-Tailscale 소스 주소는 애플리케이션
 레이어에서 차단됩니다. 개발 중 localhost를 허용하려면
 `CMUX_DEV_ALLOW_LOCALHOST=1` 환경 변수로 install 스크립트를 돌리세요.
+
+cmux 소켓 경로는 `scripts/install-launchd.sh` 실행 시
+`CMUX_SOCKET_PATH`로 설정합니다. 기본값은
+`~/Library/Application Support/cmux/cmux.sock`입니다.
+
+### Realtime voice / OpenAI
+
+이 fork는 CmuxVoice가 OpenAI Realtime WebRTC 통화를 시작할 때 쓰는
+`POST /v1/realtime/token`도 제공합니다. raw OpenAI API key는 iPhone에
+보내지 않고 Mac relay가 서버 측에서만 사용합니다.
+
+```bash
+cat > ~/.cmuxremote/.env <<'EOF'
+OPENAI_API_KEY=sk-your-openai-api-key
+EOF
+chmod 600 ~/.cmuxremote/.env
+launchctl kickstart -k "gui/$(id -u)/com.genie.cmuxremote"
+```
+
+relay는 이 키로 짧게 사는 OpenAI client secret을 발급하고, iOS voice
+앱에는 그 ephemeral secret만 돌려줍니다.
 
 > **APNs 키 필드 (`apns_team_id`, `apns_key_id`, `apns_key_path`)는
 > v1.1에서 도입 예정.** 현재는 cmux 알림이 로컬 알림으로만 표시되며,

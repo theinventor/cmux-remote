@@ -217,8 +217,32 @@ client that talks to cmux over a documented JSON-RPC schema.
 ### 1. Build and install the relay on your Mac
 
 ```bash
-git clone https://github.com/NewTurn2017/cmux-remote.git
+git clone https://github.com/theinventor/cmux-remote.git
 cd cmux-remote
+
+mkdir -p ~/.cmuxremote
+cat > ~/.cmuxremote/relay.json <<'EOF'
+{
+  "listen": "0.0.0.0:4399",
+  "allow_login": ["you@example.com"],
+  "apns": {
+    "key_path": "",
+    "key_id": "",
+    "team_id": "",
+    "topic": "",
+    "env": "sandbox"
+  },
+  "snippets": [],
+  "default_fps": 15,
+  "idle_fps": 5
+}
+EOF
+
+cat > ~/.cmuxremote/.env <<'EOF'
+OPENAI_API_KEY=sk-your-openai-api-key
+EOF
+chmod 600 ~/.cmuxremote/.env
+
 swift build -c release --product cmux-relay
 
 # Install as a launchd user agent (auto-starts on login)
@@ -233,7 +257,7 @@ Health check:
 
 ```bash
 curl -s http://$(tailscale ip -4):4399/v1/health
-# {"ok":true,"version":"0.1.0"}
+# {"ok":true}
 ```
 
 Socket probe:
@@ -269,20 +293,49 @@ the menu bar.
 
 ## Configuration
 
-The relay reads `~/.cmuxremote/relay.json` (created by
-`install-launchd.sh` if missing):
+The relay reads `~/.cmuxremote/relay.json`:
 
 ```json
 {
-  "listen":      "0.0.0.0:4399",
-  "cmux_socket": "/Users/<you>/Library/Application Support/cmux/cmux.sock",
-  "diff_hz":     15
+  "listen": "0.0.0.0:4399",
+  "allow_login": ["you@example.com"],
+  "apns": {
+    "key_path": "",
+    "key_id": "",
+    "team_id": "",
+    "topic": "",
+    "env": "sandbox"
+  },
+  "snippets": [],
+  "default_fps": 15,
+  "idle_fps": 5
 }
 ```
 
 `listen` is `0.0.0.0`, but non-Tailscale source addresses are refused
 at the application layer regardless. To allow localhost in dev, run
 the installer with `CMUX_DEV_ALLOW_LOCALHOST=1`.
+
+The cmux socket path is configured through `CMUX_SOCKET_PATH` when running
+`scripts/install-launchd.sh`; by default it uses
+`~/Library/Application Support/cmux/cmux.sock`.
+
+### Realtime voice / OpenAI
+
+This fork also exposes `POST /v1/realtime/token`, which CmuxVoice uses to
+start OpenAI Realtime WebRTC calls without putting your raw OpenAI API key
+on the phone. Put the key in `~/.cmuxremote/.env`:
+
+```bash
+cat > ~/.cmuxremote/.env <<'EOF'
+OPENAI_API_KEY=sk-your-openai-api-key
+EOF
+chmod 600 ~/.cmuxremote/.env
+launchctl kickstart -k "gui/$(id -u)/com.genie.cmuxremote"
+```
+
+The relay reads that key server-side, mints a short-lived OpenAI client
+secret, and returns only that ephemeral secret to the iOS voice app.
 
 > **APNs key fields (`apns_team_id`, `apns_key_id`, `apns_key_path`)
 > are coming in v1.1.** Until then, cmux notifications are presented
